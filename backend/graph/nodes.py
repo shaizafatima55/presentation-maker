@@ -738,23 +738,13 @@ async def final_node(state):
 
     source_urls = []
 
-    for source in top_sources:
-
-        if not isinstance(
-            source,
-            dict
-        ):
-            continue
-
-        url = source.get("url")
-
-        if isinstance(
-            url,
-            str
-        ) and url:
-
+      for source in top_sources:
+        if isinstance(source, dict):
+         url = source.get("url")
+         if isinstance(url, str) and url:
             source_urls.append(url)
-
+         elif isinstance(source, str):
+          source_urls.append(source)
     slides = state.get(
         "adjusted_slides",
         []
