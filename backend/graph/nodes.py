@@ -1,4 +1,5 @@
 import json
+import os
 from collections import defaultdict
 from groq import AsyncGroq
 from tavily import AsyncTavilyClient
@@ -299,8 +300,15 @@ async def final_node(state):
     }
 
     from export import generate_pptx
-    import os
-    output_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    import tempfile
+    # CHANGED: write to the platform's writable temp directory instead of a
+    # path relative to the source file. On serverless platforms (Vercel,
+    # AWS Lambda) everything except /tmp is read-only at runtime — writing
+    # next to __file__ (under /var/task/...) fails with
+    # "[Errno 30] Read-only file system". tempfile.gettempdir() resolves to
+    # /tmp on serverless and to your normal system temp dir locally, so this
+    # works in both environments without an environment check.
+    output_dir = tempfile.gettempdir()
     pptx_path = os.path.join(output_dir, f"{sid}.pptx")
     generate_pptx(deck, pptx_path)
 
