@@ -810,16 +810,13 @@ async def final_node(state):
 
     import os
 
-    output_dir = os.path.dirname(
-        os.path.dirname(
-            os.path.abspath(__file__)
-        )
+     output_dir = "/tmp"
+
+      pptx_path = os.path.join(
+        output_dir,
+      f"{sid}.pptx"
     )
 
-    pptx_path = os.path.join(
-        output_dir,
-        f"{sid}.pptx",
-    )
 
     try:
         generate_pptx(
