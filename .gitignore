@@ -1,0 +1,22 @@
+node_modules
+# Python
+venv/
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+.next/
+out/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
