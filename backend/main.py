@@ -14,16 +14,13 @@ app = FastAPI(title='AI Presentation Maker')
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://presentation-maker-86tcvxgxx-shaiza3.vercel.app",
-        "https://presentation-maker-zeta.vercel.app",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
+  
 @app.get("/")
 async def root():
     return {"message": "AI Presentation Maker API is working"}
