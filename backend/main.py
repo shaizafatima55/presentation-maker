@@ -18,6 +18,11 @@ app.add_middleware(
     allow_methods=['*'], allow_headers=['*']
 )
 
+@app.get("/")
+async def root():
+    return {"message": "AI Presentation Maker API is working"}
+
+
 async def run_graph_task(session_id: str, initial_state: dict):
     config = {'configurable': {'thread_id': session_id}}
     config_store[session_id] = config
