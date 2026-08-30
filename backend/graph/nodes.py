@@ -218,16 +218,71 @@ async def tone_node(state):
     return {'adjusted_slides': slides}
 
 
+def _normalize_slide(s, i):
+    """Coerce every field to the type the exporter expects, regardless of
+    what shape the LLM actually returned. This is the deep version of the
+    dict-check in final_node — it guards the FIELDS inside each slide, not
+    just the slide object itself."""
+    if not isinstance(s, dict):
+        return _default_slide(i)
+
+    slide_num = s.get('slide_num')
+    if not isinstance(slide_num, int):
+        slide_num = i + 1
+
+    title = s.get('title')
+    if not isinstance(title, str):
+        title = str(title) if title is not None else f"Slide {i + 1}"
+
+    layout = s.get('layout')
+    if not isinstance(layout, str):
+        layout = "content"
+
+    bullets = s.get('bullets')
+    if isinstance(bullets, str):
+        # model sometimes returns one big string instead of a list
+        bullets = [b.strip("-• ").strip() for b in bullets.split("\n") if b.strip()]
+    elif not isinstance(bullets, list):
+        bullets = []
+    else:
+        bullets = [b if isinstance(b, str) else str(b) for b in bullets]
+
+    # CHANGED: this is the field most likely causing your current error.
+    # key_stat must be a dict with value/label, or None — never a bare string.
+    key_stat = s.get('key_stat')
+    if isinstance(key_stat, dict):
+        value = key_stat.get('value')
+        label = key_stat.get('label')
+        key_stat = {'value': value if value is not None else '', 'label': label if label is not None else ''}
+    elif isinstance(key_stat, str) and key_stat.strip():
+        # model returned a bare string like "40%" instead of an object —
+        # salvage it into the expected shape instead of dropping it
+        key_stat = {'value': key_stat.strip(), 'label': ''}
+    else:
+        key_stat = None
+
+    speaker_note = s.get('speaker_note')
+    if not isinstance(speaker_note, str):
+        speaker_note = str(speaker_note) if speaker_note is not None else ''
+
+    return {
+        'slide_num': slide_num,
+        'layout': layout,
+        'title': title,
+        'bullets': bullets,
+        'key_stat': key_stat,
+        'speaker_note': speaker_note,
+    }
+
+
 async def final_node(state):
     sid = state['session_id']
     await emit(sid, 'node_start', {'node': 'final', 'message': 'Finalizing presentation'})
 
-    # CHANGED: last line of defense before export — normalize any stray
-    # non-dict entries so generate_pptx never sees a bare string.
-    safe_slides = [
-        s if isinstance(s, dict) else _default_slide(i)
-        for i, s in enumerate(state['adjusted_slides'])
-    ]
+    # CHANGED: deep-normalize every slide (not just check it's a dict) right
+    # before export, so mismatched nested fields (e.g. key_stat coming back
+    # as a string instead of an object) can never reach generate_pptx.
+    safe_slides = [_normalize_slide(s, i) for i, s in enumerate(state['adjusted_slides'])]
 
     deck = {
         'title': state['topic'],
