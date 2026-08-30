@@ -47,7 +47,11 @@ export default function HITLPanel() {
   const handleApprove = async () => {
     setIsSubmitting(true);
     try {
-      await axios.post(`/api/review/${sessionId}`, { status: 'resumed', approved_plan: plan });
+      await axios.post(
+  `${import.meta.env.VITE_API_URL}/api/review/${sessionId}`,
+  { status: 'resumed', approved_plan: plan }
+);
+
       setPhase('generating');
     } catch (err) {
       console.error(err);
