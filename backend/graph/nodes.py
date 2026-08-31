@@ -17,6 +17,21 @@ def _is_valid_slide_list(value):
 async def input_node(state):
     sid = state['session_id']
     await emit(sid, 'node_start', {'node': 'input', 'message': 'Parsing input and computing slide count'})
+
+    # FIX: this used to unconditionally recalculate slide_count from
+    # duration_minutes and overwrite whatever was already there — even if
+    # the frontend/API route already passed an explicit slide_count the
+    # user picked directly (e.g. selecting "20 slides"). That silent
+    # overwrite is why selecting 20 could come back as 16: the duration
+    # bucket always won, your actual selection never reached the rest of
+    # the pipeline. Now, if the initial state already carries a valid
+    # slide_count, it's honored as-is. The duration-based buckets only run
+    # as a fallback when no explicit count was provided.
+    explicit_count = state.get('slide_count')
+    if isinstance(explicit_count, int) and explicit_count > 0:
+        await emit(sid, 'node_done', {'node': 'input', 'message': f'Using selected slide count: {explicit_count}'})
+        return {'slide_count': explicit_count}
+
     d = state['duration_minutes']
     if d <= 9: count = 5
     elif d <= 20: count = 10
@@ -283,35 +298,48 @@ async def prioritization_node(state):
                 continue
 
         if batch is None:
-            # FIX: the whole batch failing (whether from a JSON/rate-limit
-            # error, or now also from a content-empty slide) doesn't mean
-            # every slide in it needs to fall back to a blank placeholder.
-            # Asking for ONE slide at a time is a much smaller ask than 6
-            # at once, so it's meaningfully more likely to succeed even
-            # when the full batch wasn't — this is what actually recovers
-            # content instead of showing "Slide 1, 2, 3" with nothing in
-            # them once slide counts get higher (more batches = more
-            # chances for one to fail).
+            # The whole batch failing doesn't mean every slide in it needs
+            # to fall back to a blank placeholder — asking for ONE slide at
+            # a time is a much smaller ask, so it's more likely to succeed
+            # even when the full batch wasn't.
+            #
+            # FIX: these individual retries now run CONCURRENTLY (capped by
+            # a small semaphore) instead of one at a time in a sequential
+            # loop. Sequential retries — each with its own internal
+            # exponential-backoff retries — could stack into a very long
+            # wait for a single failed batch. Running them in parallel
+            # keeps the content-recovery benefit without the slow
+            # wall-clock cost.
             await emit(sid, 'node_warning', {
                 'node': 'prioritization',
                 'message': f'Batch for slides {start + 1}-{start + batch_size} failed ({str(last_err)[:120]}), retrying individually'
             })
+
+            individual_semaphore = asyncio.Semaphore(3)
+
+            async def _retry_single_slide(slide_idx):
+                async with individual_semaphore:
+                    for single_attempt in range(2):
+                        try:
+                            single_batch = await _draft_slides_batch(
+                                client, sid, state['topic'], state['duration_minutes'],
+                                state['audience'], state['tone'], sources_text,
+                                slide_idx, 1, count
+                            )
+                            return single_batch[0]
+                        except Exception:
+                            continue
+                    return None
+
+            single_results = await asyncio.gather(
+                *[_retry_single_slide(start + j) for j in range(batch_size)],
+                return_exceptions=True
+            )
+
             batch = []
-            for j in range(batch_size):
+            for j, res in enumerate(single_results):
                 slide_idx = start + j
-                single = None
-                for single_attempt in range(2):
-                    try:
-                        single_batch = await _draft_slides_batch(
-                            client, sid, state['topic'], state['duration_minutes'],
-                            state['audience'], state['tone'], sources_text,
-                            slide_idx, 1, count
-                        )
-                        single = single_batch[0]
-                        break
-                    except Exception:
-                        continue
-                if single is None:
+                if res is None or isinstance(res, Exception):
                     # Only NOW, after a full batch retry AND an individual
                     # retry both failed for this specific slide, does it
                     # become a true placeholder.
@@ -320,8 +348,9 @@ async def prioritization_node(state):
                         'node': 'prioritization',
                         'message': f'Slide {slide_idx + 1} failed to generate even individually, using placeholder'
                     })
-                    single = _default_slide(slide_idx)
-                batch.append(single)
+                    batch.append(_default_slide(slide_idx))
+                else:
+                    batch.append(res)
 
         # Normalize every slide's shape here, right after drafting — so
         # plan review always renders consistent data regardless of which
