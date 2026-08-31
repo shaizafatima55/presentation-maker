@@ -152,6 +152,12 @@ async def _draft_slides_batch(client, sid, topic, duration_minutes, audience, to
     batch = json.loads(content)
     if not _is_valid_slide_list(batch):
         raise ValueError(f"batch starting at slide {start_idx + 1} is not a valid slide list")
+    if len(batch) != batch_size:
+        # CHANGED: this was silently accepted before — a batch returning
+        # fewer slides than asked for a valid list, so it passed the old
+        # check and quietly shortened your total deck. Now it's treated as
+        # a failure so the caller can retry it.
+        raise ValueError(f"batch starting at slide {start_idx + 1} returned {len(batch)} slides, expected {batch_size}")
     return batch
 
 
@@ -166,30 +172,51 @@ async def prioritization_node(state):
     BATCH_SIZE = 6  # CHANGED: tune this down further (e.g. 4) if you still
                      # see truncation on very long/detailed topics
 
-    try:
-        draft = []
-        for start in range(0, count, BATCH_SIZE):
-            batch_size = min(BATCH_SIZE, count - start)
-            batch = await _draft_slides_batch(
-                client, sid, state['topic'], state['duration_minutes'],
-                state['audience'], state['tone'], sources_text,
-                start, batch_size, count
-            )
-            draft.extend(batch)
-            await emit(sid, 'node_progress', {
-                'node': 'prioritization',
-                'message': f'Drafted slides {start + 1}-{start + batch_size} of {count}'
-            })
-            await asyncio.sleep(0.3)  # small throttle between batches
+    draft = []
+    any_batch_failed = False
 
-        if not _is_valid_slide_list(draft) or len(draft) != count:
-            raise ValueError(f"assembled draft has {len(draft)} slides, expected {count}")
-    except Exception as e:
-        await emit(sid, 'node_error', {
+    for start in range(0, count, BATCH_SIZE):
+        batch_size = min(BATCH_SIZE, count - start)
+        batch = None
+        last_err = None
+
+        # CHANGED: retry THIS batch specifically (up to 2 attempts) before
+        # giving up on it. Previously one bad batch nuked the whole deck —
+        # now a failure here only affects this batch's slides.
+        for batch_attempt in range(2):
+            try:
+                batch = await _draft_slides_batch(
+                    client, sid, state['topic'], state['duration_minutes'],
+                    state['audience'], state['tone'], sources_text,
+                    start, batch_size, count
+                )
+                break
+            except Exception as e:
+                last_err = e
+                continue
+
+        if batch is None:
+            # This specific batch failed after retries — pad ONLY these
+            # slides with placeholders, everything else generated stays intact.
+            any_batch_failed = True
+            await emit(sid, 'node_error', {
+                'node': 'prioritization',
+                'message': f'Slides {start + 1}-{start + batch_size} failed to generate, using placeholders: {str(last_err)[:150]}'
+            })
+            batch = [_default_slide(start + j) for j in range(batch_size)]
+
+        draft.extend(batch)
+        await emit(sid, 'node_progress', {
             'node': 'prioritization',
-            'message': f'Failed to generate the plan: {str(e)[:200]}'
+            'message': f'Drafted slides {start + 1}-{start + batch_size} of {count}'
         })
-        draft = [_default_slide(i) for i in range(count)]
+        await asyncio.sleep(0.3)  # small throttle between batches
+
+    if any_batch_failed:
+        await emit(sid, 'node_warning', {
+            'node': 'prioritization',
+            'message': 'Some slides used placeholder content because generation failed for that batch. Check the plan review screen for blank slides.'
+        })
 
     await emit(sid, 'node_done', {'node': 'prioritization', 'message': 'Draft plan created'})
     return {'top_sources': top, 'draft_plan': draft}
@@ -221,31 +248,14 @@ async def plan_review_node(state):
     return {'hitl_approved_plan': approved_plan}
 
 
-async def synthesis_node(state):
-    sid = state['session_id']
-    await emit(sid, 'node_start', {'node': 'synthesis', 'message': 'Synthesizing slide content'})
-    client = AsyncGroq(api_key=state['groq_api_key'])
-
-    # CHANGED: use the approved plan only if it's actually a valid slide list
-    candidate = state.get('hitl_approved_plan')
-    slides = candidate if _is_valid_slide_list(candidate) else state['draft_plan']
-
-    # CHANGED: this is the main fix for the rate limit. The old code did
-    # `json.dumps(state['top_sources'])` — the FULL 8-source list, each with
-    # up to 500 chars of raw content — INSIDE the per-slide loop, so the same
-    # large block was retransmitted on every single slide's prompt. For a
-    # 10-slide deck that's the same ~1500+ token dump sent 10 times in one
-    # run, which is what blew through the 8000 TPM limit. Build one short
-    # summary ONCE, outside the loop, and reuse it.
-    sources_summary = _condensed_sources(state['top_sources'])
-
-    all_slides = []
-
-    for i, slide in enumerate(slides):
+async def _synthesize_one_slide(client, sid, slide, i, sources_summary, tone, audience, semaphore):
+    """Generates one slide's full content. Pulled out of the loop so
+    multiple slides can run concurrently instead of strictly one-at-a-time."""
+    async with semaphore:
         prompt = (f"Write detailed content for this slide as JSON object with same schema "
                   f"(slide_num, layout, title, bullets, key_stat, speaker_note).\n"
                   f"Draft: {json.dumps(slide)}\nSources:\n{sources_summary}\n"
-                  f"Tone: {state['tone']}\nAudience: {state['audience']}")
+                  f"Tone: {tone}\nAudience: {audience}")
 
         try:
             res = await call_groq_with_retry(
@@ -253,20 +263,15 @@ async def synthesis_node(state):
                 model="openai/gpt-oss-20b",
                 messages=[{'role': 'user', 'content': prompt}],
                 temperature=0.7,
-                max_tokens=1200,  # CHANGED: explicit cap — one slide's
-                                  # content shouldn't need more than this;
-                                  # prevents any single-slide truncation too
+                max_tokens=1200,
                 stream=True
             )
         except Exception as e:
-            # CHANGED: surface the real failure instead of silently
-            # continuing as if nothing happened.
             await emit(sid, 'node_error', {
                 'node': 'synthesis',
                 'message': f'Failed to generate slide {i + 1}: {str(e)[:200]}'
             })
-            all_slides.append(slide if isinstance(slide, dict) else _default_slide(i))
-            continue
+            return slide if isinstance(slide, dict) else _default_slide(i)
 
         collected_text = ""
         slide_num_for_ui = slide.get('slide_num', i + 1) if isinstance(slide, dict) else i + 1
@@ -283,24 +288,40 @@ async def synthesis_node(state):
             elif text_clean.startswith('```'):
                 text_clean = text_clean.split('```')[1].split('```')[0].strip()
             final_slide = json.loads(text_clean)
-            # CHANGED: guard against the model returning a non-dict (string,
-            # number, list, etc.) — treat that as a parse failure too.
             if not isinstance(final_slide, dict):
                 raise ValueError("synthesis_node: parsed slide is not an object")
         except Exception:
-            # CHANGED: fall back to the ORIGINAL dict-shaped slide, never to
-            # whatever `slide` happened to be if it wasn't already a dict.
             final_slide = slide if isinstance(slide, dict) else _default_slide(i)
-        all_slides.append(final_slide)
+        return final_slide
 
-        # CHANGED: small proactive throttle between slides. Optional, but
-        # spreads token usage over time instead of bursting all 10 slides'
-        # worth of requests back-to-back, which reduces how often you hit
-        # the TPM ceiling in the first place. Tune or remove as needed.
-        await asyncio.sleep(0.4)
+
+async def synthesis_node(state):
+    sid = state['session_id']
+    await emit(sid, 'node_start', {'node': 'synthesis', 'message': 'Synthesizing slide content'})
+    client = AsyncGroq(api_key=state['groq_api_key'])
+
+    candidate = state.get('hitl_approved_plan')
+    slides = candidate if _is_valid_slide_list(candidate) else state['draft_plan']
+    sources_summary = _condensed_sources(state['top_sources'])
+
+    # CHANGED: this is the speed fix. Slides no longer generate strictly
+    # one-at-a-time with a 0.4s pause between each — up to
+    # SYNTHESIS_CONCURRENCY run at once. A semaphore caps how many Groq
+    # requests are in flight simultaneously, so this speeds things up
+    # noticeably without just trading "slow" for "instant rate limit".
+    # Lower this number if you start seeing 429s again; raise it if you
+    # have TPM headroom and want it faster.
+    SYNTHESIS_CONCURRENCY = 3
+    semaphore = asyncio.Semaphore(SYNTHESIS_CONCURRENCY)
+
+    tasks = [
+        _synthesize_one_slide(client, sid, slide, i, sources_summary, state['tone'], state['audience'], semaphore)
+        for i, slide in enumerate(slides)
+    ]
+    all_slides = await asyncio.gather(*tasks)  # order matches input order
 
     await emit(sid, 'node_done', {'node': 'synthesis', 'message': 'Finished synthesizing content'})
-    return {'slides_content': all_slides}
+    return {'slides_content': list(all_slides)}
 
 
 async def tone_node(state):
