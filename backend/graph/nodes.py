@@ -140,9 +140,9 @@ async def _draft_slides_batch(client, sid, topic, duration_minutes, audience, to
         model="openai/gpt-oss-20b",
         messages=[{'role': 'user', 'content': prompt}],
         temperature=0.3,
-        max_tokens=4000,  # CHANGED: explicit ceiling per batch, generous
-                          # enough for ~6 full slide objects without being
-                          # so large it risks the same truncation problem
+        max_tokens=4000,  # explicit ceiling per batch, generous enough for
+                          # ~6 full slide objects without risking the same
+                          # truncation problem
     )
     content = res.choices[0].message.content
     if content.startswith('```json'):
@@ -153,10 +153,9 @@ async def _draft_slides_batch(client, sid, topic, duration_minutes, audience, to
     if not _is_valid_slide_list(batch):
         raise ValueError(f"batch starting at slide {start_idx + 1} is not a valid slide list")
     if len(batch) != batch_size:
-        # CHANGED: this was silently accepted before — a batch returning
-        # fewer slides than asked for a valid list, so it passed the old
-        # check and quietly shortened your total deck. Now it's treated as
-        # a failure so the caller can retry it.
+        # A batch returning fewer slides than asked used to pass as valid,
+        # quietly shortening the deck. Now it's treated as a failure so the
+        # caller can retry it.
         raise ValueError(f"batch starting at slide {start_idx + 1} returned {len(batch)} slides, expected {batch_size}")
     return batch
 
@@ -169,8 +168,8 @@ async def prioritization_node(state):
     count = state['slide_count']
     sources_text = _condensed_sources(top)
 
-    BATCH_SIZE = 6  # CHANGED: tune this down further (e.g. 4) if you still
-                     # see truncation on very long/detailed topics
+    BATCH_SIZE = 6  # tune this down further (e.g. 4) if you still see
+                     # truncation on very long/detailed topics
 
     draft = []
     any_batch_failed = False
@@ -180,9 +179,9 @@ async def prioritization_node(state):
         batch = None
         last_err = None
 
-        # CHANGED: retry THIS batch specifically (up to 2 attempts) before
-        # giving up on it. Previously one bad batch nuked the whole deck —
-        # now a failure here only affects this batch's slides.
+        # Retry THIS batch specifically (up to 2 attempts) before giving up
+        # on it. A failure here only affects this batch's slides, not the
+        # whole deck.
         for batch_attempt in range(2):
             try:
                 batch = await _draft_slides_batch(
@@ -232,11 +231,11 @@ async def plan_review_node(state):
     resume_value = interrupt(state['draft_plan'])
     await emit(sid, 'hitl_resumed', {'checkpoint': 'plan_review'})
 
-    # CHANGED: this is the actual bug fix. `resume_value` is whatever the
-    # frontend sends when it resumes the interrupt. If the frontend sends the
-    # full edited slide list, use it. If it sends anything else (a boolean,
-    # a status string like "approved", a dict wrapper, etc.) fall back to the
-    # original draft_plan instead of silently treating that value as the plan.
+    # `resume_value` is whatever the frontend sends when it resumes the
+    # interrupt. If the frontend sends the full edited slide list, use it.
+    # If it sends anything else (a boolean, a status string like
+    # "approved", a dict wrapper, etc.) fall back to the original
+    # draft_plan instead of silently treating that value as the plan.
     if _is_valid_slide_list(resume_value):
         approved_plan = resume_value
     elif isinstance(resume_value, dict) and _is_valid_slide_list(resume_value.get('slides')):
@@ -250,14 +249,27 @@ async def plan_review_node(state):
 
 async def _synthesize_one_slide(client, sid, slide, i, sources_summary, tone, audience, semaphore):
     """Generates one slide's full content. Pulled out of the loop so
-    multiple slides can run concurrently instead of strictly one-at-a-time."""
-    async with semaphore:
-        prompt = (f"Write detailed content for this slide as JSON object with same schema "
-                  f"(slide_num, layout, title, bullets, key_stat, speaker_note).\n"
-                  f"Draft: {json.dumps(slide)}\nSources:\n{sources_summary}\n"
-                  f"Tone: {tone}\nAudience: {audience}")
+    multiple slides can run concurrently instead of strictly one-at-a-time.
 
+    FIX: the entire body — including starting the stream AND reading every
+    chunk from it — is now inside one try/except. Previously the try/except
+    only wrapped the call that started the stream; if an error happened
+    mid-stream (which concurrency makes more likely, e.g. a rate limit
+    tripped by another concurrent slide), it was completely uncaught. That
+    exception then propagated out of asyncio.gather() in synthesis_node and
+    cancelled every other in-flight slide task, wiping the whole deck's
+    content — not just this slide's. Now, no matter where in this function
+    something fails, we always fall back to the original draft slide
+    instead of raising.
+    """
+    async with semaphore:
+        slide_num_for_ui = slide.get('slide_num', i + 1) if isinstance(slide, dict) else i + 1
         try:
+            prompt = (f"Write detailed content for this slide as JSON object with same schema "
+                      f"(slide_num, layout, title, bullets, key_stat, speaker_note).\n"
+                      f"Draft: {json.dumps(slide)}\nSources:\n{sources_summary}\n"
+                      f"Tone: {tone}\nAudience: {audience}")
+
             res = await call_groq_with_retry(
                 client, sid=sid, node_name=f'synthesis (slide {i + 1})',
                 model="openai/gpt-oss-20b",
@@ -266,22 +278,14 @@ async def _synthesize_one_slide(client, sid, slide, i, sources_summary, tone, au
                 max_tokens=1200,
                 stream=True
             )
-        except Exception as e:
-            await emit(sid, 'node_error', {
-                'node': 'synthesis',
-                'message': f'Failed to generate slide {i + 1}: {str(e)[:200]}'
-            })
-            return slide if isinstance(slide, dict) else _default_slide(i)
 
-        collected_text = ""
-        slide_num_for_ui = slide.get('slide_num', i + 1) if isinstance(slide, dict) else i + 1
-        async for chunk in res:
-            token = chunk.choices[0].delta.content or ""
-            if token:
-                collected_text += token
-                await emit(sid, 'slide_stream', {'slide_index': i, 'slide_num': slide_num_for_ui, 'token': token})
+            collected_text = ""
+            async for chunk in res:
+                token = chunk.choices[0].delta.content or ""
+                if token:
+                    collected_text += token
+                    await emit(sid, 'slide_stream', {'slide_index': i, 'slide_num': slide_num_for_ui, 'token': token})
 
-        try:
             text_clean = collected_text
             if text_clean.startswith('```json'):
                 text_clean = text_clean.split('```json')[1].split('```')[0].strip()
@@ -290,9 +294,18 @@ async def _synthesize_one_slide(client, sid, slide, i, sources_summary, tone, au
             final_slide = json.loads(text_clean)
             if not isinstance(final_slide, dict):
                 raise ValueError("synthesis_node: parsed slide is not an object")
-        except Exception:
-            final_slide = slide if isinstance(slide, dict) else _default_slide(i)
-        return final_slide
+            return final_slide
+
+        except Exception as e:
+            # Covers failures anywhere above: starting the stream, reading
+            # chunks mid-stream, or parsing the final JSON. This slide falls
+            # back to its draft content instead of taking the whole batch
+            # down with it.
+            await emit(sid, 'node_error', {
+                'node': 'synthesis',
+                'message': f'Failed to generate slide {i + 1}, using draft content: {str(e)[:200]}'
+            })
+            return slide if isinstance(slide, dict) else _default_slide(i)
 
 
 async def synthesis_node(state):
@@ -304,13 +317,10 @@ async def synthesis_node(state):
     slides = candidate if _is_valid_slide_list(candidate) else state['draft_plan']
     sources_summary = _condensed_sources(state['top_sources'])
 
-    # CHANGED: this is the speed fix. Slides no longer generate strictly
-    # one-at-a-time with a 0.4s pause between each — up to
-    # SYNTHESIS_CONCURRENCY run at once. A semaphore caps how many Groq
-    # requests are in flight simultaneously, so this speeds things up
-    # noticeably without just trading "slow" for "instant rate limit".
-    # Lower this number if you start seeing 429s again; raise it if you
-    # have TPM headroom and want it faster.
+    # Slides no longer generate strictly one-at-a-time — up to
+    # SYNTHESIS_CONCURRENCY run at once, capped by a semaphore so only that
+    # many Groq requests are in flight simultaneously. Lower this if you
+    # start seeing 429s again; raise it if you have TPM headroom.
     SYNTHESIS_CONCURRENCY = 3
     semaphore = asyncio.Semaphore(SYNTHESIS_CONCURRENCY)
 
@@ -318,10 +328,31 @@ async def synthesis_node(state):
         _synthesize_one_slide(client, sid, slide, i, sources_summary, state['tone'], state['audience'], semaphore)
         for i, slide in enumerate(slides)
     ]
-    all_slides = await asyncio.gather(*tasks)  # order matches input order
+
+    # FIX: return_exceptions=True. Without this, the moment ANY one task
+    # raised, gather() immediately raised too and cancelled every other
+    # still-running task — which is why one bad slide could wipe content
+    # for the entire deck, including slides that had already succeeded.
+    # _synthesize_one_slide now shouldn't raise at all (it catches
+    # internally), but this is a second layer of safety: if something truly
+    # unexpected still escapes, we degrade that one slide to a placeholder
+    # instead of losing the whole batch.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_slides = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            await emit(sid, 'node_error', {
+                'node': 'synthesis',
+                'message': f'Slide {i + 1} task raised unexpectedly, using placeholder: {str(r)[:200]}'
+            })
+            fallback = slides[i] if isinstance(slides[i], dict) else _default_slide(i)
+            all_slides.append(fallback)
+        else:
+            all_slides.append(r)
 
     await emit(sid, 'node_done', {'node': 'synthesis', 'message': 'Finished synthesizing content'})
-    return {'slides_content': list(all_slides)}
+    return {'slides_content': all_slides}
 
 
 async def tone_node(state):
@@ -347,16 +378,16 @@ async def tone_node(state):
         elif content.startswith('```'):
             content = content.split('```')[1].split('```')[0].strip()
         adjusted = json.loads(content)
-        # CHANGED: only apply the rewrite if it's shaped correctly; never
-        # trust `adjusted[i]` to be a dict without checking.
+        # Only apply the rewrite if it's shaped correctly; never trust
+        # `adjusted[i]` to be a dict without checking.
         if _is_valid_slide_list(adjusted) and len(adjusted) == len(slides):
             for i, s in enumerate(slides):
                 if isinstance(adjusted[i], dict) and 'bullets' in adjusted[i]:
                     s['bullets'] = adjusted[i]['bullets']
     except Exception as e:
-        # CHANGED: this failing is non-fatal (slides keep their existing
-        # bullets, just untranslated to the target tone) so we don't block
-        # the pipeline — but the frontend should still know it happened.
+        # This failing is non-fatal (slides keep their existing bullets,
+        # just untranslated to the target tone) so we don't block the
+        # pipeline — but the frontend should still know it happened.
         await emit(sid, 'node_error', {
             'node': 'tone',
             'message': f'Tone adjustment failed, keeping original bullets: {str(e)[:200]}'
@@ -395,7 +426,6 @@ def _normalize_slide(s, i):
     else:
         bullets = [b if isinstance(b, str) else str(b) for b in bullets]
 
-    # CHANGED: this is the field most likely causing your current error.
     # key_stat must be a dict with value/label, or None — never a bare string.
     key_stat = s.get('key_stat')
     if isinstance(key_stat, dict):
@@ -427,9 +457,9 @@ async def final_node(state):
     sid = state['session_id']
     await emit(sid, 'node_start', {'node': 'final', 'message': 'Finalizing presentation'})
 
-    # CHANGED: deep-normalize every slide (not just check it's a dict) right
-    # before export, so mismatched nested fields (e.g. key_stat coming back
-    # as a string instead of an object) can never reach generate_pptx.
+    # Deep-normalize every slide (not just check it's a dict) right before
+    # export, so mismatched nested fields (e.g. key_stat coming back as a
+    # string instead of an object) can never reach generate_pptx.
     safe_slides = [_normalize_slide(s, i) for i, s in enumerate(state['adjusted_slides'])]
 
     deck = {
@@ -448,13 +478,13 @@ async def final_node(state):
 
     from export import generate_pptx
     import tempfile
-    # CHANGED: write to the platform's writable temp directory instead of a
-    # path relative to the source file. On serverless platforms (Vercel,
-    # AWS Lambda) everything except /tmp is read-only at runtime — writing
-    # next to __file__ (under /var/task/...) fails with
-    # "[Errno 30] Read-only file system". tempfile.gettempdir() resolves to
-    # /tmp on serverless and to your normal system temp dir locally, so this
-    # works in both environments without an environment check.
+    # Write to the platform's writable temp directory instead of a path
+    # relative to the source file. On serverless platforms (Vercel, AWS
+    # Lambda) everything except /tmp is read-only at runtime — writing next
+    # to __file__ (under /var/task/...) fails with "[Errno 30] Read-only
+    # file system". tempfile.gettempdir() resolves to /tmp on serverless
+    # and to your normal system temp dir locally, so this works in both
+    # environments without an environment check.
     output_dir = tempfile.gettempdir()
     pptx_path = os.path.join(output_dir, f"{sid}.pptx")
     generate_pptx(deck, pptx_path)
