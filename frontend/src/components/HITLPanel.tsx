@@ -1,3 +1,5 @@
+"use client";
+
 import { useState } from 'react';
 import { ArrowUp, ArrowDown, Plus, Trash2, Loader2, Check } from 'lucide-react';
 import axios from 'axios';
@@ -47,10 +49,11 @@ export default function HITLPanel() {
   const handleApprove = async () => {
     setIsSubmitting(true);
     try {
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
       await axios.post(
-  `${import.meta.env.VITE_API_URL}/api/review/${sessionId}`,
-  { status: 'resumed', approved_plan: plan }
-);
+        `${baseUrl}/api/review/${sessionId}`,
+        { status: 'resumed', approved_plan: plan }
+      );
 
       setPhase('generating');
     } catch (err) {
@@ -76,7 +79,7 @@ export default function HITLPanel() {
                 <ArrowUp className="w-4 h-4" />
               </button>
               <button onClick={() => moveSlide(sIdx, 1)} disabled={sIdx === plan.length - 1} className="hover:text-app-text disabled:opacity-30">
-                <ArrowDown className="w-4 h-4" />
+                <ArrowDown className="w-4 h-4 text-app-muted" />
               </button>
             </div>
             
@@ -125,7 +128,7 @@ export default function HITLPanel() {
         ))}
       </div>
       
-      <div className="fixed bottom-0 left-64 right-0 p-4 bg-app-surface/90 backdrop-blur border-t border-app-border flex items-center justify-between">
+      <div className="fixed bottom-0 left-64 right-0 p-4 bg-app-surface/90 backdrop-blur border-t border-app-border flex items-center justify-between z-20">
         <div className="text-sm text-app-muted">
           {plan.length} slides
         </div>

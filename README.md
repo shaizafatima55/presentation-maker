@@ -1,6 +1,6 @@
 # AI Presentation Maker
 
-An AI-powered presentation generator using LangGraph, FastAPI, and React.
+An AI-powered presentation generator using LangGraph, FastAPI, and Next.js 14.
 
 ## Features
 - 🔄 LangGraph state pipeline with 8 nodes
@@ -57,13 +57,13 @@ npm install
 npm run dev
 ```
 
-Frontend will be live at: **http://localhost:5173**
+Frontend will be live at: **http://localhost:3000**
 
 ---
 
 ## How to Use
 
-1. Open **http://localhost:5173**
+1. Open **http://localhost:3000**
 2. Enter your **Groq API Key** and **Tavily API Key** in the API Keys section
 3. Type your **topic**, set **duration**, choose **audience** and **tone**
 4. Select a **presentation theme** (7 options)
@@ -87,25 +87,33 @@ ai-presentation-maker/
 │   ├── models.py                # Pydantic request/response models
 │   ├── export.py                # python-pptx PPTX generation
 │   ├── requirements.txt
+│   ├── Dockerfile
 │   └── graph/
 │       ├── state.py             # LangGraph TypedDict state
 │       ├── nodes.py             # 8 async pipeline nodes
 │       └── graph.py             # StateGraph with MemorySaver
-└── frontend/
-    ├── src/
-    │   ├── App.tsx
-    │   ├── components/
-    │   │   ├── Header.tsx
-    │   │   ├── InputForm.tsx      # API keys + topic + theme picker
-    │   │   ├── ProgressTracker.tsx # Live node status sidebar
-    │   │   ├── HITLPanel.tsx      # Editable plan review
-    │   │   ├── SlidePreview.tsx   # Interactive 16:9 previewer
-    │   │   └── ThemeSelector.tsx
-    │   ├── hooks/useSSE.ts        # EventSource → Zustand
-    │   ├── store/useAppStore.ts   # Zustand global state
-    │   ├── themes/index.ts        # 7 theme configs
-    │   └── types/index.ts
-    └── package.json
+├── frontend/
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── layout.tsx       # Next.js App Router root layout
+│   │   │   ├── page.tsx         # Main interactive application page
+│   │   │   └── globals.css      # Dark theme & animation styles
+│   │   ├── components/
+│   │   │   ├── Header.tsx
+│   │   │   ├── InputForm.tsx    # API keys + topic + theme picker
+│   │   │   ├── ProgressTracker.tsx # Live node status sidebar
+│   │   │   ├── HITLPanel.tsx    # Editable plan review
+│   │   │   ├── SlidePreview.tsx # Interactive 16:9 previewer
+│   │   │   └── ThemeSelector.tsx
+│   │   ├── hooks/useSSE.ts      # EventSource → Zustand
+│   │   ├── store/useAppStore.ts # Zustand global state
+│   │   ├── themes/index.ts      # 7 theme configs
+│   │   └── types/index.ts
+│   ├── Dockerfile               # Container definition for Next.js
+│   ├── tailwind.config.ts       # Custom app-* color palette
+│   ├── tsconfig.json
+│   └── package.json
+└── docker-compose.yml           # Orchestration for frontend & backend
 ```
 
 ---
@@ -143,7 +151,7 @@ ai-presentation-maker/
 docker-compose up --build
 
 # Access
-# Frontend: http://localhost:5173
+# Frontend: http://localhost:3000
 # Backend:  http://localhost:8000
 ```
 

@@ -16,10 +16,6 @@ html, body {
   color: #F0F0F5;
 }
 
-#root {
-  height: 100%;
-}
-
 /* ─── Scrollbar ─────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -99,3 +95,4 @@ html, body {
 .transition-smooth {
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
+

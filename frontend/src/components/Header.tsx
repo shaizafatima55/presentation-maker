@@ -1,3 +1,5 @@
+"use client";
+
 import { Sparkles, Plus } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import ThemeSelector from './ThemeSelector';

@@ -1,3 +1,5 @@
+"use client";
+
 import { useState } from 'react';
 import axios from 'axios';
 import { Eye, EyeOff, Loader2 } from 'lucide-react';
@@ -18,10 +20,11 @@ export default function InputForm() {
 
     setIsSubmitting(true);
     try {
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
       const res = await axios.post(
-  `${import.meta.env.VITE_API_URL}/api/generate`,
-  formData
-);
+        `${baseUrl}/api/generate`,
+        formData
+      );
 
       setSessionId(res.data.session_id);
       setPhase('generating');

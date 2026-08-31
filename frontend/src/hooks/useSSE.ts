@@ -17,10 +17,10 @@ export const useSSE = (sessionId: string | null) => {
   useEffect(() => {
     if (!sessionId) return;
 
-   const eventSource = new EventSource(
-  `${import.meta.env.VITE_API_URL}/api/stream/${sessionId}`
-);
-
+    const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    const eventSource = new EventSource(
+      `${baseUrl}/api/stream/${sessionId}`
+    );
 
     eventSource.onopen = () => setIsConnected(true);
 

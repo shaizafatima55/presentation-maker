@@ -1,10 +1,12 @@
-import { useAppStore } from './store/useAppStore';
-import { useSSE } from './hooks/useSSE';
-import Header from './components/Header';
-import InputForm from './components/InputForm';
-import ProgressTracker from './components/ProgressTracker';
-import HITLPanel from './components/HITLPanel';
-import SlidePreview from './components/SlidePreview';
+"use client";
+
+import { useAppStore } from '../store/useAppStore';
+import { useSSE } from '../hooks/useSSE';
+import Header from '../components/Header';
+import InputForm from '../components/InputForm';
+import ProgressTracker from '../components/ProgressTracker';
+import HITLPanel from '../components/HITLPanel';
+import SlidePreview from '../components/SlidePreview';
 import { Loader2 } from 'lucide-react';
 
 function StreamingView() {
@@ -97,8 +99,8 @@ function GeneratingView() {
   );
 }
 
-function App() {
-  const { phase, sessionId, selectedTheme, error, reset } = useAppStore();
+export default function PresentationMaker() {
+  const { phase, sessionId, error, reset } = useAppStore();
 
   useSSE(sessionId);
 
@@ -157,5 +159,3 @@ function App() {
     </div>
   );
 }
-
-export default App;

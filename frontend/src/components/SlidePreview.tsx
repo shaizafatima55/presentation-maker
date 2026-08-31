@@ -1,3 +1,5 @@
+"use client";
+
 import { useEffect, useState } from 'react';
 import { ChevronLeft, ChevronRight, Download, Eye } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
@@ -27,7 +29,8 @@ export default function SlidePreview() {
   const theme = themes.find(t => t.id === finalDeck.theme) || themes[0];
 
   const handleDownload = () => {
-    window.open(`/api/download/${sessionId}`, '_blank');
+    const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    window.open(`${baseUrl}/api/download/${sessionId}`, '_blank');
   };
 
   return (

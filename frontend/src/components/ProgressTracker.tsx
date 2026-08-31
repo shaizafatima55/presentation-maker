@@ -1,3 +1,5 @@
+"use client";
+
 import { Check, Pause, AlertCircle, Loader2 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
 import clsx from 'clsx';
@@ -15,7 +17,7 @@ const PIPELINE_NODES: PipelineNode[] = [
 ];
 
 export default function ProgressTracker() {
-  const { nodeStatuses, nodeMessages, searchProgress, computedSlideCount, phase } = useAppStore();
+  const { nodeStatuses, nodeMessages, searchProgress, computedSlideCount } = useAppStore();
 
   return (
     <div className="w-64 bg-app-surface border-r border-app-border flex flex-col shrink-0">
