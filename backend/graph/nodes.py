@@ -106,41 +106,85 @@ async def call_groq_with_retry(client, sid=None, node_name=None, retries=4, base
     raise last_err
 
 
+def _condensed_sources(sources):
+    """Compact source reference reused across calls — avoids re-sending
+    full 500-char content blocks repeatedly, which burns tokens fast once
+    you're making several batch calls per plan."""
+    return "\n".join(
+        f"[{i + 1}] {s.get('title', '')}: {s.get('content', '')[:150]}"
+        for i, s in enumerate(sources)
+    )
+
+
+async def _draft_slides_batch(client, sid, topic, duration_minutes, audience, tone,
+                               sources_text, start_idx, batch_size, total_count):
+    """Generates ONE small batch of slides instead of the whole deck in a
+    single call. This is the actual fix for plans going blank at higher
+    slide counts: a single call asking for 20-30 full slide objects at once
+    was getting truncated by the model's output limit, producing invalid
+    JSON that silently fell back to blank placeholders. Keeping each call's
+    expected output small (a handful of slides) avoids truncation
+    regardless of how many total slides are requested."""
+    prompt = (f"Topic: {topic}\nDuration: {duration_minutes} min\nAudience: {audience}\nTone: {tone}\n"
+              f"Sources:\n{sources_text}\n\n"
+              f"This presentation has {total_count} slides total. Generate ONLY slides "
+              f"{start_idx + 1} through {start_idx + batch_size} as a JSON array of exactly "
+              f"{batch_size} slide objects, in order. Each slide MUST have: slide_num (use "
+              f"{start_idx + 1} through {start_idx + batch_size} respectively), layout, title, "
+              f"bullets (array of 3-5 strings), key_stat (object with value and label, or null), "
+              f"speaker_note. Respond with ONLY the raw JSON array — no markdown fences, no "
+              f"commentary, nothing before or after it.")
+
+    res = await call_groq_with_retry(
+        client, sid=sid, node_name=f'prioritization (slides {start_idx + 1}-{start_idx + batch_size})',
+        model="openai/gpt-oss-20b",
+        messages=[{'role': 'user', 'content': prompt}],
+        temperature=0.3,
+        max_tokens=4000,  # CHANGED: explicit ceiling per batch, generous
+                          # enough for ~6 full slide objects without being
+                          # so large it risks the same truncation problem
+    )
+    content = res.choices[0].message.content
+    if content.startswith('```json'):
+        content = content.split('```json')[1].split('```')[0].strip()
+    elif content.startswith('```'):
+        content = content.split('```')[1].split('```')[0].strip()
+    batch = json.loads(content)
+    if not _is_valid_slide_list(batch):
+        raise ValueError(f"batch starting at slide {start_idx + 1} is not a valid slide list")
+    return batch
+
+
 async def prioritization_node(state):
     sid = state['session_id']
     await emit(sid, 'node_start', {'node': 'prioritization', 'message': 'Prioritizing sources and drafting plan'})
     top = state['source_map'][:8]
-    sources_text = json.dumps(top, indent=2)
     client = AsyncGroq(api_key=state['groq_api_key'])
     count = state['slide_count']
-    prompt = (f"Topic: {state['topic']}\nDuration: {state['duration_minutes']} min\n"
-              f"Audience: {state['audience']}\nTone: {state['tone']}\nSources:\n{sources_text}\n\n"
-              f"Create a JSON array of EXACTLY {count} slides. Each slide MUST have: slide_num, layout, "
-              f"title, bullets (array of 3-5 strings), key_stat (object with value and label, or null), "
-              f"speaker_note. Do not include markdown formatting, just the raw JSON array.")
+    sources_text = _condensed_sources(top)
+
+    BATCH_SIZE = 6  # CHANGED: tune this down further (e.g. 4) if you still
+                     # see truncation on very long/detailed topics
 
     try:
-        res = await call_groq_with_retry(
-            client, sid=sid, node_name='prioritization',
-            model="openai/gpt-oss-20b",
-            messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.3
-        )
-        content = res.choices[0].message.content
-        if content.startswith('```json'):
-            content = content.split('```json')[1].split('```')[0].strip()
-        elif content.startswith('```'):
-            content = content.split('```')[1].split('```')[0].strip()
-        draft = json.loads(content)
-        if not _is_valid_slide_list(draft):
-            raise ValueError("prioritization_node: parsed draft is not a valid slide list")
+        draft = []
+        for start in range(0, count, BATCH_SIZE):
+            batch_size = min(BATCH_SIZE, count - start)
+            batch = await _draft_slides_batch(
+                client, sid, state['topic'], state['duration_minutes'],
+                state['audience'], state['tone'], sources_text,
+                start, batch_size, count
+            )
+            draft.extend(batch)
+            await emit(sid, 'node_progress', {
+                'node': 'prioritization',
+                'message': f'Drafted slides {start + 1}-{start + batch_size} of {count}'
+            })
+            await asyncio.sleep(0.3)  # small throttle between batches
+
+        if not _is_valid_slide_list(draft) or len(draft) != count:
+            raise ValueError(f"assembled draft has {len(draft)} slides, expected {count}")
     except Exception as e:
-        # CHANGED: this is what was hiding your real failures. Before, ANY
-        # exception here — including the 429 — was silently caught and
-        # replaced with blank "Slide 1", "Slide 2" placeholders, so the UI
-        # showed empty cards as if generation had succeeded. Now we emit a
-        # real error the frontend can display, and only fall back to
-        # placeholders as a last resort so the pipeline doesn't hard-crash.
         await emit(sid, 'node_error', {
             'node': 'prioritization',
             'message': f'Failed to generate the plan: {str(e)[:200]}'
@@ -193,10 +237,7 @@ async def synthesis_node(state):
     # 10-slide deck that's the same ~1500+ token dump sent 10 times in one
     # run, which is what blew through the 8000 TPM limit. Build one short
     # summary ONCE, outside the loop, and reuse it.
-    sources_summary = "\n".join(
-        f"[{i + 1}] {s.get('title', '')}: {s.get('content', '')[:150]}"
-        for i, s in enumerate(state['top_sources'])
-    )
+    sources_summary = _condensed_sources(state['top_sources'])
 
     all_slides = []
 
@@ -212,6 +253,9 @@ async def synthesis_node(state):
                 model="openai/gpt-oss-20b",
                 messages=[{'role': 'user', 'content': prompt}],
                 temperature=0.7,
+                max_tokens=1200,  # CHANGED: explicit cap — one slide's
+                                  # content shouldn't need more than this;
+                                  # prevents any single-slide truncation too
                 stream=True
             )
         except Exception as e:
