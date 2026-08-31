@@ -1,5 +1,6 @@
 import json
 import os
+import asyncio
 from collections import defaultdict
 from groq import AsyncGroq
 from tavily import AsyncTavilyClient
@@ -72,6 +73,39 @@ def _default_slide(i):
             "bullets": [], "key_stat": None, "speaker_note": ""}
 
 
+async def call_groq_with_retry(client, sid=None, node_name=None, retries=4, base_delay=2.0, **kwargs):
+    """Wraps client.chat.completions.create with exponential backoff, but
+    ONLY for rate-limit (429) errors. Any other exception is raised
+    immediately — we never want a real failure silently swallowed and
+    mistaken for "just retry harder".
+
+    This directly targets the TPM 429 you're hitting: the Groq error even
+    tells you the exact wait ("try again in 937.5ms") — a short backoff
+    almost always clears it instead of failing the whole run.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            is_rate_limit = "429" in msg or "rate_limit_exceeded" in msg.lower() or "rate limit" in msg.lower()
+            if is_rate_limit and attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                if sid:
+                    await emit(sid, 'node_retry', {
+                        'node': node_name or 'groq_call',
+                        'attempt': attempt + 1,
+                        'retry_in_seconds': round(delay, 1),
+                        'message': f'Rate limited — retrying in {delay:.1f}s (attempt {attempt + 1}/{retries})'
+                    })
+                await asyncio.sleep(delay)
+                continue
+            raise
+    raise last_err
+
+
 async def prioritization_node(state):
     sid = state['session_id']
     await emit(sid, 'node_start', {'node': 'prioritization', 'message': 'Prioritizing sources and drafting plan'})
@@ -86,7 +120,8 @@ async def prioritization_node(state):
               f"speaker_note. Do not include markdown formatting, just the raw JSON array.")
 
     try:
-        res = await client.chat.completions.create(
+        res = await call_groq_with_retry(
+            client, sid=sid, node_name='prioritization',
             model="openai/gpt-oss-20b",
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.3
@@ -97,11 +132,19 @@ async def prioritization_node(state):
         elif content.startswith('```'):
             content = content.split('```')[1].split('```')[0].strip()
         draft = json.loads(content)
-        # CHANGED: guard against the model returning something that isn't a
-        # proper list-of-dicts (e.g. a single object, a string, etc.)
         if not _is_valid_slide_list(draft):
             raise ValueError("prioritization_node: parsed draft is not a valid slide list")
-    except Exception:
+    except Exception as e:
+        # CHANGED: this is what was hiding your real failures. Before, ANY
+        # exception here — including the 429 — was silently caught and
+        # replaced with blank "Slide 1", "Slide 2" placeholders, so the UI
+        # showed empty cards as if generation had succeeded. Now we emit a
+        # real error the frontend can display, and only fall back to
+        # placeholders as a last resort so the pipeline doesn't hard-crash.
+        await emit(sid, 'node_error', {
+            'node': 'prioritization',
+            'message': f'Failed to generate the plan: {str(e)[:200]}'
+        })
         draft = [_default_slide(i) for i in range(count)]
 
     await emit(sid, 'node_done', {'node': 'prioritization', 'message': 'Draft plan created'})
@@ -143,25 +186,51 @@ async def synthesis_node(state):
     candidate = state.get('hitl_approved_plan')
     slides = candidate if _is_valid_slide_list(candidate) else state['draft_plan']
 
+    # CHANGED: this is the main fix for the rate limit. The old code did
+    # `json.dumps(state['top_sources'])` — the FULL 8-source list, each with
+    # up to 500 chars of raw content — INSIDE the per-slide loop, so the same
+    # large block was retransmitted on every single slide's prompt. For a
+    # 10-slide deck that's the same ~1500+ token dump sent 10 times in one
+    # run, which is what blew through the 8000 TPM limit. Build one short
+    # summary ONCE, outside the loop, and reuse it.
+    sources_summary = "\n".join(
+        f"[{i + 1}] {s.get('title', '')}: {s.get('content', '')[:150]}"
+        for i, s in enumerate(state['top_sources'])
+    )
+
     all_slides = []
 
     for i, slide in enumerate(slides):
         prompt = (f"Write detailed content for this slide as JSON object with same schema "
                   f"(slide_num, layout, title, bullets, key_stat, speaker_note).\n"
-                  f"Draft: {json.dumps(slide)}\nSources: {json.dumps(state['top_sources'])}\n"
+                  f"Draft: {json.dumps(slide)}\nSources:\n{sources_summary}\n"
                   f"Tone: {state['tone']}\nAudience: {state['audience']}")
-        res = await client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.7,
-            stream=True
-        )
+
+        try:
+            res = await call_groq_with_retry(
+                client, sid=sid, node_name=f'synthesis (slide {i + 1})',
+                model="openai/gpt-oss-20b",
+                messages=[{'role': 'user', 'content': prompt}],
+                temperature=0.7,
+                stream=True
+            )
+        except Exception as e:
+            # CHANGED: surface the real failure instead of silently
+            # continuing as if nothing happened.
+            await emit(sid, 'node_error', {
+                'node': 'synthesis',
+                'message': f'Failed to generate slide {i + 1}: {str(e)[:200]}'
+            })
+            all_slides.append(slide if isinstance(slide, dict) else _default_slide(i))
+            continue
+
         collected_text = ""
+        slide_num_for_ui = slide.get('slide_num', i + 1) if isinstance(slide, dict) else i + 1
         async for chunk in res:
             token = chunk.choices[0].delta.content or ""
             if token:
                 collected_text += token
-                await emit(sid, 'slide_stream', {'slide_index': i, 'slide_num': slide.get('slide_num', i + 1), 'token': token})
+                await emit(sid, 'slide_stream', {'slide_index': i, 'slide_num': slide_num_for_ui, 'token': token})
 
         try:
             text_clean = collected_text
@@ -180,6 +249,12 @@ async def synthesis_node(state):
             final_slide = slide if isinstance(slide, dict) else _default_slide(i)
         all_slides.append(final_slide)
 
+        # CHANGED: small proactive throttle between slides. Optional, but
+        # spreads token usage over time instead of bursting all 10 slides'
+        # worth of requests back-to-back, which reduces how often you hit
+        # the TPM ceiling in the first place. Tune or remove as needed.
+        await asyncio.sleep(0.4)
+
     await emit(sid, 'node_done', {'node': 'synthesis', 'message': 'Finished synthesizing content'})
     return {'slides_content': all_slides}
 
@@ -195,7 +270,8 @@ async def tone_node(state):
     client = AsyncGroq(api_key=state['groq_api_key'])
     prompt = f"Rewrite the bullets for these slides in a {state['tone']} tone. Keep JSON structure.\nSlides: {json.dumps(slides)}"
     try:
-        res = await client.chat.completions.create(
+        res = await call_groq_with_retry(
+            client, sid=sid, node_name='tone',
             model="openai/gpt-oss-20b",
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.5
@@ -212,8 +288,14 @@ async def tone_node(state):
             for i, s in enumerate(slides):
                 if isinstance(adjusted[i], dict) and 'bullets' in adjusted[i]:
                     s['bullets'] = adjusted[i]['bullets']
-    except Exception:
-        pass
+    except Exception as e:
+        # CHANGED: this failing is non-fatal (slides keep their existing
+        # bullets, just untranslated to the target tone) so we don't block
+        # the pipeline — but the frontend should still know it happened.
+        await emit(sid, 'node_error', {
+            'node': 'tone',
+            'message': f'Tone adjustment failed, keeping original bullets: {str(e)[:200]}'
+        })
 
     await emit(sid, 'node_done', {'node': 'tone', 'message': f"Tone adjusted to {state['tone']}"})
     return {'adjusted_slides': slides}
