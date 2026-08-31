@@ -73,6 +73,81 @@ def _default_slide(i):
             "bullets": [], "key_stat": None, "speaker_note": ""}
 
 
+def _has_real_content(slide, i):
+    """A slide that merely has the right keys isn't necessarily a slide
+    with real content — a thin/malformed model response like
+    {"title": "Slide 1", "bullets": []} used to pass the old "is it a
+    dict" check and get accepted as-is. This checks it actually has
+    something to show: at least one non-empty bullet, and a title that
+    isn't just the auto-generated placeholder form."""
+    if not isinstance(slide, dict):
+        return False
+    bullets = slide.get('bullets')
+    has_bullets = isinstance(bullets, list) and any(
+        isinstance(b, str) and b.strip() for b in bullets
+    )
+    title = slide.get('title')
+    has_real_title = isinstance(title, str) and title.strip() and title.strip() != f"Slide {i + 1}"
+    return has_bullets and has_real_title
+
+
+def _normalize_slide(s, i):
+    """Coerce every field to the type the exporter (and the plan-review
+    UI) expects, regardless of what shape the LLM actually returned.
+    Applied right after drafting AND right after synthesis — not just once
+    at final export — so plan review and the final output are always
+    working from the same consistently-shaped data."""
+    if not isinstance(s, dict):
+        return _default_slide(i)
+
+    slide_num = s.get('slide_num')
+    if not isinstance(slide_num, int):
+        slide_num = i + 1
+
+    title = s.get('title')
+    if not isinstance(title, str):
+        title = str(title) if title is not None else f"Slide {i + 1}"
+
+    layout = s.get('layout')
+    if not isinstance(layout, str):
+        layout = "content"
+
+    bullets = s.get('bullets')
+    if isinstance(bullets, str):
+        # model sometimes returns one big string instead of a list
+        bullets = [b.strip("-• ").strip() for b in bullets.split("\n") if b.strip()]
+    elif not isinstance(bullets, list):
+        bullets = []
+    else:
+        bullets = [b if isinstance(b, str) else str(b) for b in bullets]
+
+    # key_stat must be a dict with value/label, or None — never a bare string.
+    key_stat = s.get('key_stat')
+    if isinstance(key_stat, dict):
+        value = key_stat.get('value')
+        label = key_stat.get('label')
+        key_stat = {'value': value if value is not None else '', 'label': label if label is not None else ''}
+    elif isinstance(key_stat, str) and key_stat.strip():
+        # model returned a bare string like "40%" instead of an object —
+        # salvage it into the expected shape instead of dropping it
+        key_stat = {'value': key_stat.strip(), 'label': ''}
+    else:
+        key_stat = None
+
+    speaker_note = s.get('speaker_note')
+    if not isinstance(speaker_note, str):
+        speaker_note = str(speaker_note) if speaker_note is not None else ''
+
+    return {
+        'slide_num': slide_num,
+        'layout': layout,
+        'title': title,
+        'bullets': bullets,
+        'key_stat': key_stat,
+        'speaker_note': speaker_note,
+    }
+
+
 async def call_groq_with_retry(client, sid=None, node_name=None, retries=4, base_delay=2.0, **kwargs):
     """Wraps client.chat.completions.create with exponential backoff, but
     ONLY for rate-limit (429) errors. Any other exception is raised
@@ -157,6 +232,19 @@ async def _draft_slides_batch(client, sid, topic, duration_minutes, audience, to
         # quietly shortening the deck. Now it's treated as a failure so the
         # caller can retry it.
         raise ValueError(f"batch starting at slide {start_idx + 1} returned {len(batch)} slides, expected {batch_size}")
+
+    # FIX: this is the gap that let thin/empty slides through silently.
+    # `_is_valid_slide_list` above only checks "is this a list of dicts" —
+    # a slide like {"title": "Slide 1", "bullets": []} passes that check
+    # fine. It has the right shape but no actual content, and used to sail
+    # straight through to plan review looking exactly like your symptom:
+    # a slide number with nothing in it. Now a batch containing any
+    # content-empty slide is rejected here so the caller retries it instead
+    # of silently accepting it.
+    for j, slide in enumerate(batch):
+        if not _has_real_content(slide, start_idx + j):
+            raise ValueError(f"slide {start_idx + j + 1} in batch has no real content (empty bullets or placeholder title)")
+
     return batch
 
 
@@ -195,15 +283,50 @@ async def prioritization_node(state):
                 continue
 
         if batch is None:
-            # This specific batch failed after retries — pad ONLY these
-            # slides with placeholders, everything else generated stays intact.
-            any_batch_failed = True
-            await emit(sid, 'node_error', {
+            # FIX: the whole batch failing (whether from a JSON/rate-limit
+            # error, or now also from a content-empty slide) doesn't mean
+            # every slide in it needs to fall back to a blank placeholder.
+            # Asking for ONE slide at a time is a much smaller ask than 6
+            # at once, so it's meaningfully more likely to succeed even
+            # when the full batch wasn't — this is what actually recovers
+            # content instead of showing "Slide 1, 2, 3" with nothing in
+            # them once slide counts get higher (more batches = more
+            # chances for one to fail).
+            await emit(sid, 'node_warning', {
                 'node': 'prioritization',
-                'message': f'Slides {start + 1}-{start + batch_size} failed to generate, using placeholders: {str(last_err)[:150]}'
+                'message': f'Batch for slides {start + 1}-{start + batch_size} failed ({str(last_err)[:120]}), retrying individually'
             })
-            batch = [_default_slide(start + j) for j in range(batch_size)]
+            batch = []
+            for j in range(batch_size):
+                slide_idx = start + j
+                single = None
+                for single_attempt in range(2):
+                    try:
+                        single_batch = await _draft_slides_batch(
+                            client, sid, state['topic'], state['duration_minutes'],
+                            state['audience'], state['tone'], sources_text,
+                            slide_idx, 1, count
+                        )
+                        single = single_batch[0]
+                        break
+                    except Exception:
+                        continue
+                if single is None:
+                    # Only NOW, after a full batch retry AND an individual
+                    # retry both failed for this specific slide, does it
+                    # become a true placeholder.
+                    any_batch_failed = True
+                    await emit(sid, 'node_error', {
+                        'node': 'prioritization',
+                        'message': f'Slide {slide_idx + 1} failed to generate even individually, using placeholder'
+                    })
+                    single = _default_slide(slide_idx)
+                batch.append(single)
 
+        # Normalize every slide's shape here, right after drafting — so
+        # plan review always renders consistent data regardless of which
+        # path (batch success, individual retry, or placeholder) produced it.
+        batch = [_normalize_slide(s, start + j) for j, s in enumerate(batch)]
         draft.extend(batch)
         await emit(sid, 'node_progress', {
             'node': 'prioritization',
@@ -305,7 +428,7 @@ async def _synthesize_one_slide(client, sid, slide, i, sources_summary, tone, au
                 'node': 'synthesis',
                 'message': f'Failed to generate slide {i + 1}, using draft content: {str(e)[:200]}'
             })
-            return slide if isinstance(slide, dict) else _default_slide(i)
+            return _normalize_slide(slide, i)
 
 
 async def synthesis_node(state):
@@ -347,9 +470,9 @@ async def synthesis_node(state):
                 'message': f'Slide {i + 1} task raised unexpectedly, using placeholder: {str(r)[:200]}'
             })
             fallback = slides[i] if isinstance(slides[i], dict) else _default_slide(i)
-            all_slides.append(fallback)
+            all_slides.append(_normalize_slide(fallback, i))
         else:
-            all_slides.append(r)
+            all_slides.append(_normalize_slide(r, i))
 
     await emit(sid, 'node_done', {'node': 'synthesis', 'message': 'Finished synthesizing content'})
     return {'slides_content': all_slides}
@@ -395,62 +518,6 @@ async def tone_node(state):
 
     await emit(sid, 'node_done', {'node': 'tone', 'message': f"Tone adjusted to {state['tone']}"})
     return {'adjusted_slides': slides}
-
-
-def _normalize_slide(s, i):
-    """Coerce every field to the type the exporter expects, regardless of
-    what shape the LLM actually returned. This is the deep version of the
-    dict-check in final_node — it guards the FIELDS inside each slide, not
-    just the slide object itself."""
-    if not isinstance(s, dict):
-        return _default_slide(i)
-
-    slide_num = s.get('slide_num')
-    if not isinstance(slide_num, int):
-        slide_num = i + 1
-
-    title = s.get('title')
-    if not isinstance(title, str):
-        title = str(title) if title is not None else f"Slide {i + 1}"
-
-    layout = s.get('layout')
-    if not isinstance(layout, str):
-        layout = "content"
-
-    bullets = s.get('bullets')
-    if isinstance(bullets, str):
-        # model sometimes returns one big string instead of a list
-        bullets = [b.strip("-• ").strip() for b in bullets.split("\n") if b.strip()]
-    elif not isinstance(bullets, list):
-        bullets = []
-    else:
-        bullets = [b if isinstance(b, str) else str(b) for b in bullets]
-
-    # key_stat must be a dict with value/label, or None — never a bare string.
-    key_stat = s.get('key_stat')
-    if isinstance(key_stat, dict):
-        value = key_stat.get('value')
-        label = key_stat.get('label')
-        key_stat = {'value': value if value is not None else '', 'label': label if label is not None else ''}
-    elif isinstance(key_stat, str) and key_stat.strip():
-        # model returned a bare string like "40%" instead of an object —
-        # salvage it into the expected shape instead of dropping it
-        key_stat = {'value': key_stat.strip(), 'label': ''}
-    else:
-        key_stat = None
-
-    speaker_note = s.get('speaker_note')
-    if not isinstance(speaker_note, str):
-        speaker_note = str(speaker_note) if speaker_note is not None else ''
-
-    return {
-        'slide_num': slide_num,
-        'layout': layout,
-        'title': title,
-        'bullets': bullets,
-        'key_stat': key_stat,
-        'speaker_note': speaker_note,
-    }
 
 
 async def final_node(state):
